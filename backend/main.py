@@ -1,18 +1,18 @@
-from fastapi import FastAPI, HTTPException, Query
-from typing import Optional
-import firebase_admin
-from firebase_admin import credentials, firestore
-import os
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel
+from firebase_admin import credentials, auth, initialize_app, firestore
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
 import logging
+import httpx
+import os
 
 # Initialize FastAPI app
 app = FastAPI()
 
 # Initialize Firebase Admin SDK
 cred = credentials.Certificate("serviceAccountKey.json")
-firebase_admin.initialize_app(cred)
+initialize_app(cred)
 
 # Initialize Firestore client
 db = firestore.client()
@@ -20,9 +20,52 @@ db = firestore.client()
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
 
-# Define a function to fetch specific fields from Firestore document
+# Models
+class User(BaseModel):
+    username: str
+    email: str
+    password: str
+
+class LoginUser(BaseModel):
+    email: str
+    password: str
+
+class AuthResponse(BaseModel):
+    message: str
+    token: str = None
+    error: str = None
+
+class LoginResponse(BaseModel):
+    error: bool
+    message: str
+    loginResult: dict = None
+
+class UserDetail(BaseModel):
+    username: str
+    email: str
+    password: str
+
+class Place(BaseModel):
+    place_id: str
+    name: str
+    rating: float = None
+    reviews_count: int = None
+    address: str = None
+    lat: float
+    long: float
+    category: str = None
+    image_url: str = None
+    caption_idn: str = None
+    caption_eng: str = None
+
+class PlaceCoordinates(BaseModel):
+    place_id: str
+    name: str
+    lat: float
+    long: float
+
+# Utility functions
 def fetch_fields(doc):
-    # Extract specific fields from the Firestore document
     return {
         'place_id': doc.id,
         'name': doc.get('name'),
@@ -30,149 +73,155 @@ def fetch_fields(doc):
         'reviews_count': doc.get('reviews_count'),
         'address': doc.get('address'),
         'lat': doc.get('lat'),
-        'long': doc.get('long'),        
+        'long': doc.get('long'),
         'category': doc.get('category'),
         'image_url': f"http://34.101.153.83:3000/img/{doc.id}.jpg",
         'caption_idn': doc.get('caption_idn'),
         'caption_eng': doc.get('caption_eng')
     }
-    
-# Define a function to fetch specific fields from Firestore document
+
 def fetch_lon_lat(doc):
-    # Extract 'long' and 'lat' fields from the Firestore document
     return {
         'place_id': doc.id,
         'name': doc.get('name'),
         'lat': doc.get('lat'),
-        'long': doc.get('long')        
+        'long': doc.get('long')
     }
-    
+
 # Mount the static files directory
 app.mount("/img", StaticFiles(directory="img"), name="img")
 
+# Root endpoint
 @app.get("/")
 def read_root():
-    return {"REST API for Journey on Solo"}
+    return {"message": "REST API for Journey on Solo"}
 
-@app.get("/data")
+# Endpoint Sign-Up
+@app.post("/signup", response_model=AuthResponse)
+async def signup(user: User):
+    try:
+        # Ensure username is unique
+        user_ref = db.collection('users').document(user.username)
+        if user_ref.get().exists:
+            raise HTTPException(status_code=400, detail={"message": "Signup failed", "error": "Username already exists"})
+        
+        user_record = auth.create_user(
+            email=user.email,
+            password=user.password,
+            email_verified=False,
+            disabled=False
+        )
+        # Save additional user data in Firestore with username as document ID
+        user_data = {
+            "username": user.username,
+            "email": user.email,
+            "password": user.password  
+        }
+        user_ref.set(user_data)
+        
+        return AuthResponse(message="Signup successful", token=user_record.uid)
+    except auth.EmailAlreadyExistsError:
+        raise HTTPException(status_code=400, detail={"message": "Signup failed", "error": "Email already exists"})
+    except Exception as e:
+        raise HTTPException(status_code=400, detail={"message": "Signup failed", "error": str(e)})
+
+# Endpoint Login
+@app.post("/login", response_model=LoginResponse)
+async def login(login_user: LoginUser):
+    try:
+        api_key = os.getenv("FIREBASE_API_KEY", "AIzaSyDxCpXsq-ZSEVHKXqZgO-059JaALp9mXWY")  # Replace with your API Key
+        url = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={api_key}"
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, json={
+                "email": login_user.email,
+                "password": login_user.password,
+                "returnSecureToken": True
+            })
+
+        if response.status_code != 200:
+            error_message = response.json().get("error", {}).get("message", "Unknown error")
+            raise HTTPException(status_code=400, detail={"message": "Login failed", "error": error_message})
+
+        id_token = response.json().get("idToken")
+
+        # Fetch user details from Firestore
+        user_ref = db.collection('users').where('email', '==', login_user.email).stream()
+        user_data = None
+        for doc in user_ref:
+            user_data = doc.to_dict()
+            break
+
+        if user_data is None:
+            raise HTTPException(status_code=400, detail={"message": "Login failed", "error": "User not found in Firestore"})
+
+        login_result = {
+            "username": user_data['username'],
+            "email": user_data['email'],
+            "token": id_token
+        }
+
+        return LoginResponse(error=False, message="success", loginResult=login_result)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail={"message": "Login failed", "error": str(e)})
+
+# Endpoint to get user details
+@app.get("/user/{username}", response_model=UserDetail)
+async def get_user_details(username: str):
+    try:
+        doc_ref = db.collection('users').document(username)
+        doc = doc_ref.get()
+        if doc.exists:
+            user_data = doc.to_dict()
+            return UserDetail(username=user_data['username'], email=user_data['email'], password=user_data['password'])
+        raise HTTPException(status_code=404, detail=f"User with username '{username}' not found")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Firestore data endpoints
+@app.get("/data", response_model=list[Place])
 async def get_data():
     try:
         collection_ref = db.collection('location')
         docs = collection_ref.stream()
-        
-        # Initialize an empty list to store formatted data
-        formatted_data = []
-        
-        # Iterate over documents and format each one
-        for doc in docs:
-            data = fetch_fields(doc)
-            formatted_data.append(data)
-            
+        formatted_data = [fetch_fields(doc) for doc in docs]
         return formatted_data
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# Endpoint display detail
-@app.get("/data/{place_id}")
+@app.get("/data/{place_id}", response_model=Place)
 async def get_detail_data(place_id: str):
     try:
-        # Fetch data from Firestore
-        collection_ref = db.collection('location')
-        query_ref = collection_ref.where('place_id', '==', place_id).limit(1).get()
-        for doc in query_ref:
-            data = fetch_fields(doc)
-            # Add the image URL to the response
-            # data['image_url'] = f"34.101.153.83:3000/img/{place_id}.jpg"
-            return data
+        doc_ref = db.collection('location').document(place_id)
+        doc = doc_ref.get()
+        if doc.exists:
+            return fetch_fields(doc)
         raise HTTPException(status_code=404, detail=f"Document with place_id '{place_id}' not found")
-    except HTTPException as e:
-        raise e
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# Endpoint to fetch all 'lon' and 'lat'
-@app.get("/coordinates")
+@app.get("/coordinates", response_model=list[PlaceCoordinates])
 async def get_all_coordinates():
     try:
         collection_ref = db.collection('location')
         docs = collection_ref.stream()
-        
-        # Initialize an empty list to store long and lat data
-        coordinates = []
-        
-        # Iterate over documents and fetch long and lat
-        for doc in docs:
-            data = fetch_lon_lat(doc)
-            coordinates.append(data)
-            
+        coordinates = [fetch_lon_lat(doc) for doc in docs]
         return coordinates
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    
-# Endpoint to fetch only 'long' and 'lat' by place_id
-@app.get("/coordinates/{place_id}")
+
+@app.get("/coordinates/{place_id}", response_model=PlaceCoordinates)
 async def get_coordinates(place_id: str):
     try:
-        collection_ref = db.collection('location')
-        
-        # Query Firestore for documents where 'place_id' matches
-        query_ref = collection_ref.where('place_id', '==', place_id).limit(1).get()
-        
-        # Check if any documents match the query
-        for doc in query_ref:
-            # Fetch only 'long' and 'lat' fields
-            data = fetch_lon_lat(doc)
-            return data
-        
-        # If no document found with the given place_id
+        doc_ref = db.collection('location').document(place_id)
+        doc = doc_ref.get()
+        if doc.exists:
+            return fetch_lon_lat(doc)
         raise HTTPException(status_code=404, detail=f"Document with place_id '{place_id}' not found")
-    
-    except HTTPException:
-        # Propagate HTTP exceptions (e.g., 404) as they are
-        raise
-    
     except Exception as e:
-        # Handle other exceptions with a generic 500 Internal Server Error
         raise HTTPException(status_code=500, detail=str(e))
 
-
-
-# New endpoint for search functionality
-@app.get("/search")
-async def search_data(
-    name: Optional[str] = Query(None, description="Name to search for"),
-):
-    try:
-        # Log the query parameter
-        logging.debug(f"Search query parameter: name='{name}'")
-
-        collection_ref = db.collection('location')  # Ensure you are querying the correct collection
-        query = collection_ref
-        
-        if name:
-            query = query.where('name', '==', name)
-        
-        docs = query.stream()
-        
-        # Convert to list and log the raw documents fetched
-        raw_docs = list(docs)
-        logging.debug(f"Raw documents fetched: {raw_docs}")
-        
-        results = []
-        
-        for doc in raw_docs:
-            data = fetch_fields(doc)
-            results.append(data)
-        
-        logging.debug(f"Search results: {results}")
-        
-        if not results:
-            logging.debug("No documents matched the query.")
-        
-        return results
-
-    except Exception as e:
-        logging.error(f"Error during search: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+# Start the server
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=3000)
